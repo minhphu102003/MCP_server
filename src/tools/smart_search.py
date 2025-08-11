@@ -4,12 +4,15 @@ from langchain_core.tools import tool
 from datetime import datetime
 import requests, re, json
 
+from services.smart_search_service import step_combine, step_extract_urls, step_load_state, step_rewrite, step_scrape, step_search, step_summarize
 from tools.scrape import get_webpage_content
 from tools.summarize import summarize_text
 from utils.env import get_env_variable
+from utils.logger import log_event, report_progress
 from utils.sse import chunk_text
 from utils.state import STATE_STORE, SearchState, SearchTurn
 from tools.rewrite import rewrite_query
+from fastmcp import Context
 
 class SmartSearchInput(BaseModel):
     session_id: str = Field(
@@ -197,105 +200,51 @@ def smart_search(**kwargs) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
-def smart_search_stream(**kwargs) -> Iterable[Dict[str, Any]]:
+async def smart_search_stream_mcp(
+    session_id: str,
+    query: str,
+    prefer_academic: Optional[bool] = None,
+    time_range: Optional[str] = None,
+    extra_sites: Optional[List[str]] = None,
+    filetype_pdf: Optional[bool] = None,
+    target_language: Optional[str] = None,
+    ctx: Context = None,
+) -> Dict[str, Any]:
+    await log_event(ctx, "info", f"smart_search start | session={session_id}", session_id=session_id)
+    await report_progress(ctx, 1)
 
-    args = SmartSearchInput(**kwargs)
-    yield {"event": "start", "session_id": args.session_id, "query": args.query}
-
-    state: SearchState = STATE_STORE.get(args.session_id) or SearchState(session_id=args.session_id)
-    yield {"event": "state_loaded", "turn_count": len(state.turns)}
-
-    prefs = _infer_prefs(args)
-    yield {"event": "prefs_inferred", "prefs": prefs}
-
-    yield {"event": "rewrite_started", "query": args.query}
-    try:
-        rewritten = rewrite_query.invoke({"query": args.query, **prefs}).strip()
-        use_query = rewritten if rewritten else args.query
-        yield {"event": "rewrite_done", "rewritten_query": rewritten, "used_query": use_query}
-    except Exception as e:
-        rewritten = None
-        use_query = args.query
-        yield {"event": "rewrite_failed", "error": str(e), "used_query": use_query}
-
-    yield {"event": "search_started", "used_query": use_query}
-    sr = _tavily_search(use_query) 
-    raw = sr.get("raw")
-    latency_ms = sr.get("latency_ms")
-    yield {"event": "search_meta", "latency_ms": latency_ms}
-
-    top_urls: List[str] = []
-    if isinstance(raw, dict):
-        hits = raw.get("results") or raw.get("data") or []
-        for h in hits[:3]:
-            url = h.get("url") or h.get("link")
-            if url:
-                top_urls.append(url)
-    yield {"event": "search_top_urls", "top_urls": top_urls}
-
-    scraped_contents: List[str] = []
-    for url in top_urls:
-        yield {"event": "scrape_started", "url": url}
-        try:
-            content = get_webpage_content.invoke({"url": url})  # string dài
-            if content:
-                scraped_contents.append(content)
-                for i, chunk in enumerate(chunk_text(content, size=2000)):
-                    yield {"event": "scrape_chunk", "url": url, "index": i, "content": chunk}
-                yield {"event": "scrape_done", "url": url, "length": len(content)}
-            else:
-                yield {"event": "scrape_empty", "url": url}
-        except Exception as e:
-            yield {"event": "scrape_failed", "url": url, "error": str(e)}
-
-    historical_context = "\n\n".join(
-        t.original_query + " → " + (t.rewritten_query or t.original_query)
-        for t in state.turns[-3:]
+    state = await step_load_state(session_id, ctx)
+    args = dict(
+        session_id=session_id, query=query,
+        prefer_academic=prefer_academic, time_range=time_range,
+        extra_sites=extra_sites, filetype_pdf=filetype_pdf, target_language=target_language
     )
-    combined_text = "\n\n".join(scraped_contents)
-    if historical_context:
-        combined_text = f"Previous search context:\n{historical_context}\n\nCurrent content:\n{combined_text}"
+    prefs = _infer_prefs(type("Tmp", (), args)) 
+    await log_event(ctx, "info", f"prefs inferred | {prefs}", session_id=session_id)
+    await report_progress(ctx, 7)
 
-    yield {
-        "event": "combine_ready",
-        "has_history": bool(historical_context),
-        "combined_chars": len(combined_text)
-    }
-
-    yield {"event": "summary_started"}
-    try:
-        summary = summarize_text.invoke({
-            "text": combined_text,
-            "max_words": 250,
-            "language": prefs.get("target_language"),
-            "style": "balanced",
-            "include_bullets": True,
-            "title": args.query
-        })
-        if isinstance(summary, str):
-            for i, chunk in enumerate(chunk_text(summary, size=1200)):
-                yield {"event": "summary_chunk", "index": i, "content": chunk}
-        yield {"event": "summary_done"}
-    except Exception as e:
-        summary = None
-        yield {"event": "summary_failed", "error": str(e)}
+    rewritten, use_query = await step_rewrite(query, prefs, ctx)
+    raw, latency_ms = await step_search(use_query, ctx)
+    urls = step_extract_urls(raw)
+    scraped = await step_scrape(urls, ctx)
+    combined = step_combine(state, scraped)
+    await log_event(ctx, "info", f"combine ready | total_chars={len(combined)} | has_history={combined.startswith('Previous search context:')}")
+    summary = await step_summarize(combined, query, prefs.get("target_language"), ctx)
 
     turn = SearchTurn(
-        original_query=args.query,
+        original_query=query,
         inferred_prefs=prefs,
         rewritten_query=rewritten,
         used_query=use_query,
         provider="tavily",
-        result_meta={
-            "top_urls": top_urls,
-            "latency_ms": latency_ms,
-            "summary": summary
-        }
+        result_meta={"top_urls": urls, "latency_ms": latency_ms, "summary": summary}
     )
     state.turns.append(turn)
     STATE_STORE.set(state)
+    await log_event(ctx, "info", "state persisted")
+    await report_progress(ctx, 100)
 
-    out = {
+    return {
         "rewritten_query": rewritten,
         "used_query": use_query,
         "result": raw,
@@ -303,8 +252,7 @@ def smart_search_stream(**kwargs) -> Iterable[Dict[str, Any]]:
         "state_meta": {
             "session_id": state.session_id,
             "turn_count": len(state.turns),
-            "latest_top_urls": top_urls,
+            "latest_top_urls": urls,
             "latency_ms": latency_ms
         }
     }
-    yield {"event": "end", "final": out}

@@ -13,6 +13,7 @@ dependencies = [
   "google-generativeai>=0.8.5",
   "langchain-core>=0.3.72",
   "pytest>=8.4.1",
+  "supabase>=2.18.0",
 ]
 
 [tool.pytest.ini_options]
